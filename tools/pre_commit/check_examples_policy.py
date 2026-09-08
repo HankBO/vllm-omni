@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ratchet: block new model-specific Python files added under examples/.
 
 Per issue #6260, all new Python paths under examples/ are blocked by default.
@@ -77,27 +78,52 @@ def _get_merge_base(base_ref: str) -> str:
         cwd=REPO_ROOT,
     )
     if result.returncode != 0:
-        print(f"check_examples_policy: could not find merge base with {base_ref}", file=sys.stderr)
+        print(
+            f"check_examples_policy: could not find merge base with {base_ref}.\n"
+            f"Fetch the base branch with `git fetch origin main --no-tags`, "
+            f"or rerun with `--base-ref <available-ref>`.",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    return result.stdout.strip()
+    merge_base = result.stdout.strip()
+    if not merge_base:
+        print(
+            f"check_examples_policy: git returned an empty merge base for {base_ref}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return merge_base
 
 
 def _get_added_paths(merge_base: str) -> list[str]:
-    # --diff-filter=ACR: Added, Copied, Renamed destination paths only
-    result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=ACR", merge_base, "HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-    )
-    if result.returncode != 0:
-        print("check_examples_policy: git diff failed", file=sys.stderr)
-        sys.exit(1)
-    return [
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip().startswith("examples/") and line.strip().endswith(".py")
+    # Inspect both the committed branch diff and the index. The former is
+    # needed in CI; the latter lets pre-commit reject a new path before commit.
+    diff_commands = [
+        ["git", "diff", merge_base, "HEAD"],
+        ["git", "diff", "--cached", merge_base],
     ]
+    paths: set[str] = set()
+    for diff_command in diff_commands:
+        result = subprocess.run(
+            [
+                *diff_command,
+                "--name-only",
+                "--find-copies",
+                "--diff-filter=ACR",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+        if result.returncode != 0:
+            print("check_examples_policy: git diff failed", file=sys.stderr)
+            sys.exit(1)
+        paths.update(
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().startswith("examples/") and line.strip().endswith(".py")
+        )
+    return sorted(paths)
 
 
 def main(argv: list[str] | None = None) -> int:
