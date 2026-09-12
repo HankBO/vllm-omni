@@ -652,21 +652,24 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """Dispatch to the CUDA-graph wrapper when captured, else eager."""
         self._maybe_init_depformer_graphs()
-        if self._depformer_graph is not None:
-            return self._depformer_graph(
+        torch.cuda.nvtx.range_push("personaplex_depformer")
+        try:
+            if self._depformer_graph is not None:
+                return self._depformer_graph(
+                    text_token,
+                    hidden,
+                    audio_tokens=audio_tokens,
+                    audio_provided=audio_provided,
+                )
+            return self.depformer(
                 text_token,
                 hidden,
                 audio_tokens=audio_tokens,
                 audio_provided=audio_provided,
+                num_steps=num_steps,
             )
-        out = self.depformer(
-            text_token,
-            hidden,
-            audio_tokens=audio_tokens,
-            audio_provided=audio_provided,
-            num_steps=num_steps,
-        )
-        return out
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     def _maybe_init_depformer_graphs(self) -> None:
         """Initialize the CUDA-graph wrapper for the depformer if not already done."""

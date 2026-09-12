@@ -66,6 +66,9 @@ from vllm_omni.worker.sampling_utils import (
 )
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
+import torch.cuda.profiler as profiler
+import torch.cuda.nvtx as nvtx
+
 logger = init_logger(__name__)
 
 
@@ -1203,6 +1206,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+
+        if not hasattr(self, "_nsys_tick_count"):
+            self._nsys_tick_count = 0
+        self._nsys_tick_count += 1
+
+        if self._nsys_tick_count == 20:
+            profiler.start()
+
+        if self._nsys_tick_count == 120:
+            profiler.stop()
+        
+        nvtx.range_push("personaplex_temporal_forward")
         try:
             with (
                 nullcontext(),
@@ -1247,6 +1262,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     if callable(set_batch_req_ids):
                         set_batch_req_ids(req_ids[:num_reqs])
         finally:
+            nvtx.range_pop()
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
 
@@ -2140,7 +2156,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
-
+        nvtx.range_push("personaplex_sample_and_depformer")
         post_sample_mm = getattr(getattr(self, "model", None), "post_sample_multimodal_outputs", None)
         if callable(post_sample_mm):
             multimodal_outputs = post_sample_mm(
@@ -2157,6 +2173,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             sample_hidden_states=sample_hidden_states,
             multimodal_outputs=multimodal_outputs,
         )
+        nvtx.range_pop()
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
