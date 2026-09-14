@@ -1,8 +1,99 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Analyze Nsight Systems SQLite export for PersonaPlex Baseline profiling.
+
+Capture (use the lifecycle e2e driver on main):
+
+  # Terminal 1: request (max_sessions: 2)
+  python tests/e2e/online_serving/personaplex_realtime_duplex.py   \\
+    --url ws://127.0.0.1:8099/v1/realtime?duplex=1   --model nvidia/personaplex-7b-v1 \\
+    --input-wav <input.wav>  --output-dir tmp/personaplex-realtime-duplex
+
+  # Terminal 2: nsys capture
+    nsys profile \\
+    --trace-fork-before-exec=true \\
+    -t cuda,nvtx,osrt \\
+    --capture-range=cudaProfilerApi \\
+    -o personaplex_main_b2_baseline \\
+    --force-overwrite=true \\
+    python -m vllm_omni.entrypoints.cli.main serve   "$MODEL" \\
+    --omni   --deploy-config vllm_omni/deploy/personaplex.yaml   --host 0.0.0.0   --port 8099
+
+    nsys export --type sqlite --output personaplex_main_b2_baseline.sqlite personaplex_main_b2_baseline.nsys-rep
+    python analyze_nsys.py personaplex_main_b2_baseline.sqlite
+
+    The server records ticks 20-120 via torch.cuda.profiler.start/stop in gpu_ar_model_runner.
+    Segment kernel counts use launch correlation (runtime correlationId).
+"""
 
 import argparse
 import sqlite3
+
+ANCHOR_MARKER = "personaplex_sample_and_depformer"
+SEGMENT_MARKERS = (
+    "personaplex_temporal_forward",
+    "personaplex_sample_and_depformer",
+)
+GRAPH_LAUNCH_NAMES = ("cudaGraphLaunch", "cudaGraphLaunchKernel")
+
+
+def _table_exists(cursor, table_name):
+    cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (table_name,))
+    return cursor.fetchone() is not None
+
+
+def _load_runtime_rows(cursor):
+    if _table_exists(cursor, "StringIds"):
+        cursor.execute(
+            """
+            SELECT r.start, r.end, r.correlationId, COALESCE(s.value, '')
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+            LEFT JOIN StringIds s ON s.id = r.nameId
+            ORDER BY r.start ASC
+            """
+        )
+    else:
+        cursor.execute("SELECT start, end, correlationId, '' FROM CUPTI_ACTIVITY_KIND_RUNTIME ORDER BY start ASC")
+    return [(int(start), int(end), int(corr_id), str(name)) for start, end, corr_id, name in cursor.fetchall()]
+
+
+def _load_kernel_by_correlation(cursor):
+    cursor.execute("SELECT start, end, correlationId FROM CUPTI_ACTIVITY_KIND_KERNEL")
+    grouped: dict[int, list[tuple[int, int]]] = {}
+    for start, end, corr_id in cursor.fetchall():
+        grouped.setdefault(int(corr_id), []).append((int(start), int(end)))
+    return grouped
+
+
+def _load_nvtx_ranges(cursor, segment_markers):
+    placeholder = ",".join("?" for _ in segment_markers)
+    cursor.execute(
+        f"""SELECT text, start, end FROM NVTX_EVENTS WHERE text IN ({placeholder}) ORDER BY start ASC""",
+        segment_markers,
+    )
+    events: dict[str, list[tuple[int, int]]] = {marker: [] for marker in segment_markers}
+    for text, start, end in cursor.fetchall():
+        events[str(text)].append((int(start), int(end)))
+    return events
+
+
+def _correlated_for_nvtx(
+    nvtx_start: int,
+    nvtx_end: int,
+    runtime_rows: list[tuple[int, int, int, str]],
+    kernel_by_corr: dict[int, list[tuple[int, int]]],
+) -> tuple[int, int, int]:
+    kernels = 0
+    launches = 0
+    graph_replays = 0
+    for runtime_start, _, corr_id, name in runtime_rows:
+        if runtime_start < nvtx_start or runtime_start > nvtx_end:
+            continue
+        launches += 1
+        if any(token in name for token in GRAPH_LAUNCH_NAMES):
+            graph_replays += 1
+        kernels += len(kernel_by_corr.get(corr_id, []))
+    return kernels, launches, graph_replays
 
 
 def analyze_nsys_sqlite(db_path, tick_ms=80.0):
@@ -67,16 +158,24 @@ def analyze_nsys_sqlite(db_path, tick_ms=80.0):
     idle_ms = trace_duration_ms - active_ms
     idle_fraction = (idle_ms / trace_duration_ms) * 100
 
-    estimated_ticks = trace_duration_ms / tick_ms
+    nvtx_ranges = _load_nvtx_ranges(cursor, SEGMENT_MARKERS)
+    observed_anchor_ticks = len(nvtx_ranges.get(ANCHOR_MARKER, []))
+    trace_span_over_nominal_ticks = trace_duration_ms / tick_ms if tick_ms else 0.0
+
+    runtime_rows = _load_runtime_rows(cursor)
+    kernel_by_corr = _load_kernel_by_correlation(cursor)
 
     print("=" * 50)
     print(" Nsys Profile Automated Analysis Report")
     print("=" * 50)
     print(f"Total Trace Duration      : {trace_duration_ms:.2f} ms")
-    print(f"Estimated Ticks           : {estimated_ticks:.1f} (based on {tick_ms}ms/tick)")
+    print(f"Observed Anchor Ticks           : {observed_anchor_ticks} ({ANCHOR_MARKER})")
+    print(
+        f"Trace span / nominal tick : {trace_span_over_nominal_ticks:.1f}"
+        f"(metadata only; not observed tick count; nominal={tick_ms} ms)"
+    )
     print("-" * 50)
-    print(f"Total Kernel Launches     : {total_kernels}")
-    print(f"Avg Launches per Tick     : {total_kernels / estimated_ticks:.0f} launches / tick")
+    print(f"Total Kernel records     : {len(kernels)}")
     print("-" * 50)
     print(f"Absolute GPU Active Time  : {active_ms:.2f} ms")
     print(f"Absolute GPU Idle Time    : {idle_ms:.2f} ms")
@@ -87,50 +186,31 @@ def analyze_nsys_sqlite(db_path, tick_ms=80.0):
     # PART 2: NVTX Specific Kernel Launch Counts
     # ==========================================
     # Map kernels precisely to the marked NVTX ranges
-    query_nvtx = """
-    SELECT
-        n.text AS nvtx_marker,
-        COUNT(DISTINCT n.start) AS num_ticks,
-        COUNT(k.start) AS total_kernels,
-        CAST(COUNT(k.start) AS FLOAT) / COUNT(DISTINCT n.start) AS avg_kernels_per_tick
-    FROM
-        NVTX_EVENTS n
-    LEFT JOIN
-        CUPTI_ACTIVITY_KIND_KERNEL k
-        ON k.start >= n.start AND k.end <= n.end
-    WHERE
-        LOWER(n.text) LIKE '%temporal_forward%'
-        OR LOWER(n.text) LIKE '%sample_and_depformer%'
-        OR LOWER(n.text) LIKE '%depformer%'
-    GROUP BY
-        n.text;
-    """
+    print("\n" + "=" * 50)
+    print(" NVTX Segment-Specific Kernel Analysis(launch-correlated)")
+    print("=" * 50)
+    for marker in SEGMENT_MARKERS:
+        occurrences = nvtx_ranges.get(marker, [])
+        total_kernels = 0
+        total_launches = 0
+        total_graph_replays = 0
+        for start, end in occurrences:
+            kernels_n, launches_n, graph_n = _correlated_for_nvtx(start, end, runtime_rows, kernel_by_corr)
+            total_kernels += kernels_n
+            total_launches += launches_n
+            total_graph_replays += graph_n
+        observed = len(occurrences)
+        avg_kernels = total_kernels / observed if observed else 0.0
+        avg_graph = total_graph_replays / observed if observed else 0.0
 
-    try:
-        cursor.execute(query_nvtx)
-        nvtx_rows = cursor.fetchall()
-
-        print("\n" + "=" * 50)
-        print(" NVTX Segment-Specific Kernel Analysis")
-        print("=" * 50)
-
-        if not nvtx_rows:
-            print("No matching NVTX markers found. Check range names or trace capture.")
-        else:
-            for row in nvtx_rows:
-                marker_name = row[0]
-                num_ticks = row[1]
-                segment_kernels = row[2]
-                avg_kernels = row[3]
-
-                print(f"Segment (NVTX)       : {marker_name}")
-                print(f"Sampled Occurrences  : {num_ticks} times")
-                print(f"Total Kernels inside : {segment_kernels}")
-                print(f"Avg Launches / Call  : {avg_kernels:.1f} launches")
-                print("-" * 50)
-
-    except sqlite3.OperationalError as e:
-        print(f"\nFailed to query NVTX events (table might not exist): {e}")
+        print(f"Segment (NVTX)       : {marker}")
+        print(f"Observed Occurrences  : {observed} times")
+        print(f"Total Kernels Records : {total_kernels}")
+        print(f"Total CUDA Runtime calls : {total_launches}")
+        print(f"Total Graph Replays  : {total_graph_replays}")
+        print(f"Avg Correlated Kernels   : {avg_kernels:.1f} kernels")
+        print(f"Avg Graph Replays / Call: {avg_graph:.1f} replays")
+        print("-" * 50)
 
     conn.close()
 
