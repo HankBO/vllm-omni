@@ -163,6 +163,9 @@ def test_policy_rejects_committed_and_staged_new_example_paths(tmp_path):
     # Test staged but not committed case
     (examples / "staged.py").write_text("staged\n")
     git("add", "examples/staged.py")
+    unicode_path = examples / "测试路径.py"
+    unicode_path.write_text("unicode path\n")
+    git("add", "examples/测试路径.py")
 
     with patch("tools.pre_commit.check_examples_policy.REPO_ROOT", tmp_path):
         merge_base = _get_merge_base(base)
@@ -177,6 +180,7 @@ def test_policy_rejects_committed_and_staged_new_example_paths(tmp_path):
         "examples/copied.py",
         "examples/renamed.py",
         "examples/staged.py",
+        "examples/测试路径.py",
     }
 
     # A repository without a merge base must fail rather than skip the check.

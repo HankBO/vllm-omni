@@ -108,6 +108,7 @@ def _get_added_paths(merge_base: str) -> list[str]:
             [
                 *diff_command,
                 "--name-only",
+                "-z",
                 "--find-copies",
                 "--diff-filter=ACR",
             ],
@@ -120,7 +121,7 @@ def _get_added_paths(merge_base: str) -> list[str]:
             sys.exit(1)
         paths.update(
             line.strip()
-            for line in result.stdout.splitlines()
+            for line in result.stdout.split("\0")
             if line.strip().startswith("examples/") and line.strip().endswith(".py")
         )
     return sorted(paths)
