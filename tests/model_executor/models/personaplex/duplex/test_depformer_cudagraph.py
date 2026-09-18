@@ -17,10 +17,12 @@ from tests.model_executor.models.personaplex.duplex._depformer_testing import (
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer_cudagraph import (
     CUDAGraphDepformerWrapper,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
     pytest.mark.core_model,
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="NVIDIA CUDA required"),
 ]
 
 
