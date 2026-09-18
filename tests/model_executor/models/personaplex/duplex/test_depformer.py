@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -12,9 +14,12 @@ from tests.model_executor.models.personaplex.duplex._depformer_testing import (
     frame,
     make_depformer,
 )
+from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer_cudagraph import (
     CUDAGraphDepformerWrapper,
+    resolve_depformer_graph_settings,
 )
+from vllm_omni.model_executor.models.personaplex.personaplex_talker import PersonaPlexTalkerForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -77,3 +82,67 @@ def test_cpu_warmup_does_not_capture() -> None:
     wrapper(text, hidden, audio_tokens=tokens, audio_provided=provided)
     assert wrapper.stats.eager == 1
     assert wrapper.stats.replays == 0
+
+
+def test_resolve_depformer_graph_settings_uses_compilation_and_max_seqs() -> None:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4], cudagraph_num_of_warmups=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=10),
+    )
+    enabled, sizes, max_batch, warmup = resolve_depformer_graph_settings(vllm_config, enabled=True)
+    assert enabled is True
+    assert sizes == (1, 2, 4)
+    assert max_batch == 10
+    assert warmup == 1
+
+
+def test_personaplex_config_depformer_cuda_graphs_default_off() -> None:
+    assert PersonaPlexConfig().depformer_cuda_graphs is False
+
+
+def _talker_with_depformer(depformer, recorded: list) -> SimpleNamespace:
+    model = SimpleNamespace(
+        _dtype=torch.float32,
+        depformer=depformer,
+        _depformer_graphs_enabled=False,
+        _depformer_graph=None,
+        _duplex_stage0_runtime=lambda: SimpleNamespace(
+            record_sample=lambda *, request_id, text_token, agent_codes: recorded.append(
+                (request_id, text_token.clone(), agent_codes.clone())
+            )
+        ),
+    )
+    model._maybe_init_depformer_graphs = PersonaPlexTalkerForConditionalGeneration._maybe_init_depformer_graphs.__get__(
+        model
+    )
+    model._run_depformer = PersonaPlexTalkerForConditionalGeneration._run_depformer.__get__(model)
+    return model
+
+
+def test_run_depformer_uses_eager_module_when_graphs_disabled() -> None:
+    model = make_depformer(seed=40)
+    recorded: list = []
+    talker = _talker_with_depformer(model, recorded)
+    text, hidden, tokens, provided = frame(batch=1, seed=41)
+    got = PersonaPlexTalkerForConditionalGeneration._run_depformer(
+        talker, text, hidden, audio_tokens=tokens, audio_provided=provided
+    )
+    want = model(text, hidden, audio_tokens=tokens, audio_provided=provided)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_talk_run_depformer_dispatches_to_wrapper() -> None:
+    model = make_depformer(seed=42)
+    wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1], enabled=False)
+    recorded: list = []
+    talker = _talker_with_depformer(model, recorded)
+    talker._depformer_graphs_enabled = True
+    talker._depformer_graph = wrapper
+    talker._maybe_init_depformer_graphs = lambda: None
+    text, hidden, tokens, provided = frame(batch=1, seed=43)
+    got = PersonaPlexTalkerForConditionalGeneration._run_depformer(talker, text, hidden, tokens, provided)
+    want = model(text, hidden, audio_tokens=tokens, audio_provided=provided)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert wrapper.stats.calls == 1
+    assert wrapper.stats.eager == 1
