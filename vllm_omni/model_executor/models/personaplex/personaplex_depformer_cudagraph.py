@@ -7,14 +7,15 @@ this module support full-graph capture and replay of the forward pass under
 the unified duplex path. Shapes are static per padded batch, so a model-local
 wrapper captures ``PersonaPlexDepformer.forward`` and replays it.
 
-Opt-in via ``CUDAGraphDepformerWrapper.warmup``; capture failure falls back to
-eager.
+Opt-in via ``CUDAGraphDepformerWrapper.warmup`` and ``PersonaPlexConfig.depformer_cuda_graphs``
+on the talker; capture failure falls back to eager.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -26,7 +27,33 @@ from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
 
 logger = init_logger(__name__)
 
-__all__ = ["CUDAGraphDepformerWrapper", "DepformerCUDAGraphStats"]
+__all__ = ["CUDAGraphDepformerWrapper", "DepformerCUDAGraphStats", "resolve_depformer_graph_settings"]
+
+DEFAULT_DEPFORMER_CUDA_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16)
+
+
+def resolve_depformer_graph_settings(
+    vllm_config: Any,
+    *,
+    enabled: bool,
+    default_sizes: Sequence[int] = DEFAULT_DEPFORMER_CUDA_SIZES,
+    default_max_batch: int = 32,
+    default_warmup_iters: int = 3,
+) -> tuple[bool, tuple[int, ...], int, int]:
+    model_config = getattr(vllm_config, "model_config", None)
+    enforce_eager = bool(getattr(model_config, "enforce_eager", False))
+    enabled = enabled and not enforce_eager
+    compilation = getattr(vllm_config, "compilation_config", None)
+    raw_sizes = getattr(compilation, "cudagraph_capture_sizes", None)
+    warmup = getattr(compilation, "cudagraph_num_of_warmups", None)
+    warm_iters = default_warmup_iters if warmup is None else max(warmup, 0)
+    sizes = raw_sizes if raw_sizes else default_sizes
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = getattr(scheduler, "max_num_seqs", 0)
+    max_batch = max(max(sizes), max_num_seqs, 1)
+    if not enabled:
+        max_batch = max(max_batch, default_max_batch)
+    return enabled, tuple(sizes), max_batch, warm_iters
 
 
 @dataclass
@@ -233,16 +260,19 @@ class CUDAGraphDepformerWrapper:
 
     def warmup(self, device: torch.device) -> None:
         """Capture all sizes. No-op when disabled or not CUDA."""
-        if self._warmed_up:
+        if self._graphs or (self._warmed_up and self.enabled):
             return
-        self._warmed_up = True
-        if not self.enabled or device.type != "cuda" or not torch.cuda.is_available():
+        if not self.enabled:
+            self._warmed_up = True
+            return
+        if device.type != "cuda" or not torch.cuda.is_available():
             logger.info(
                 "CUDAGraphDepformerWrapper warmup skipped (enabled=%s, device=%s)",
                 self.enabled,
                 device,
             )
             return
+        self._warmed_up = True
         for padded_b in self.capture_sizes:
             entry = self._capture_one(padded_b, device)
             if entry is not None:
