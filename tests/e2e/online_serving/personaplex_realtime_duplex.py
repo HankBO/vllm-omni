@@ -437,10 +437,52 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     primary, created = await _open_session(args, persona=args.persona)
+
+    if args.single_session:
+        capabilities = _capabilities(created)
+        if capabilities.get("implementation_level") != "model_native_duplex":
+            raise AssertionError(f"single session does not have the expected implementation level: {capabilities}")
+        primary_frames = await _stream_frames(primary, pcm)
+        await wait_for(
+            lambda: len(primary.events.audio_bytes()) // (2 * FRAME_SAMPLES) >= primary_frames - args.max_frame_deficit,
+            timeout_s=args.timeout_s,
+            label="primary frame coverage",
+        )
+        await wait_for(
+            lambda: len(primary.events.audio_bytes()) // (2 * FRAME_SAMPLES) >= primary_frames - args.max_frame_deficit,
+            timeout_s=args.timeout_s,
+            label="primary frame coverage",
+        )
+        await asyncio.sleep(args.drain_s)
+        primary_audio, _primary_response_ids, primary_stats = _session_result(
+            primary,
+            input_frames=primary_frames,
+            args=args,
+            minimum_chunks=args.minimum_audio_chunks,
+        )
+        _save(output_dir, "primary", primary, primary_audio)
+        await _close_session(primary, timeout_s=args.timeout_s)
+        errors = primary.events.errors()
+        result = {
+            "ok": not errors,
+            "model": args.model,
+            "input": {**input_identity, "tail_s": args.tail_s},
+            "capabilities": capabilities,
+            "primary": {"session_id": ids["primary"], "input_frames": primary_frames, **primary_stats},
+            "errors": errors,
+            "output_dir": str(output_dir),
+            "single_session": True,
+        }
+        (output_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        if errors:
+            raise AssertionError(f"single session encountered errors: {errors}")
+        return result
+
     secondary, secondary_created = await _open_session(args, persona=args.secondary_persona)
     ids = {"primary": _session_id(created), "secondary": _session_id(secondary_created)}
     if not ids["primary"] or not ids["secondary"] or ids["primary"] == ids["secondary"]:
         raise AssertionError(f"server did not allocate distinct session ids: {ids}")
+
     capabilities = _capabilities(created)
     if _capabilities(secondary_created) != capabilities:
         raise AssertionError("concurrent sessions returned different capabilities")
@@ -857,6 +899,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", required=True)
     parser.add_argument("--input-wav", required=True)
+    parser.add_argument(
+        "--single-session",
+        action="store_true",
+        help="Run only the primary session instead of the multi-session lifecycle checks.",
+    )
     parser.add_argument(
         "--expected-input-sha256",
         help="Fail before opening sessions when the input WAV does not match this SHA-256.",
