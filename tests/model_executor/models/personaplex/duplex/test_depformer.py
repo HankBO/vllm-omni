@@ -134,16 +134,17 @@ def test_resolve_replay_entry_returns_eager_reason(
     assert reason is expected_reason
 
 
-def test_resolve_depformer_graph_settings_uses_compilation_and_max_seqs() -> None:
+def test_resolve_depformer_graph_settings_derives_sizes_from_duplex_max_sessions() -> None:
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enforce_eager=False),
-        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4], cudagraph_num_of_warmups=1),
+        model_config=SimpleNamespace(enforce_eager=False, duplex_max_sessions=10),
+        compilation_config=SimpleNamespace(cudagraph_num_of_warmups=1),
         scheduler_config=SimpleNamespace(max_num_seqs=10),
     )
     enabled, sizes, max_batch, warmup = resolve_depformer_graph_settings(vllm_config, enabled=True)
     assert enabled is True
-    assert sizes == (1, 2, 4)
+    assert sizes == (1, 2, 4, 8, 10)
     assert max_batch == 10
+    assert sizes[-1] == max_batch
     assert warmup == 1
 
 
