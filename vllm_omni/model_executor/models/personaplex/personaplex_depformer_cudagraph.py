@@ -8,7 +8,8 @@ the unified duplex path. Shapes are static per padded batch, so a model-local
 wrapper captures ``PersonaPlexDepformer.forward`` and replays it.
 
 Opt-in via ``CUDAGraphDepformerWrapper.warmup`` and ``PersonaPlexConfig.depformer_cuda_graphs``
-on the talker; capture failure falls back to eager.
+on the talker; capture failure falls back to eager. The Upperbound of capture sizes
+are derived from `duplex_session.max_sessions`, not a YAML override.
 """
 
 from __future__ import annotations
@@ -29,14 +30,23 @@ logger = init_logger(__name__)
 
 __all__ = ["CUDAGraphDepformerWrapper", "DepformerCUDAGraphStats", "resolve_depformer_graph_settings"]
 
-DEFAULT_DEPFORMER_CUDA_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16)
+
+def _capture_sizes_up_to(max_num: int) -> tuple[int, ...]:
+    """Powers of two up to `max_num`, inclusive."""
+    sizes: list[int] = []
+    size = 1
+    while size <= max_num:
+        sizes.append(size)
+        size *= 2
+    if sizes[-1] < max_num:
+        sizes.append(max_num)
+    return tuple(sizes)
 
 
 def resolve_depformer_graph_settings(
     vllm_config: Any,
     *,
     enabled: bool,
-    default_sizes: Sequence[int] = DEFAULT_DEPFORMER_CUDA_SIZES,
     default_max_batch: int = 32,
     default_warmup_iters: int = 3,
 ) -> tuple[bool, tuple[int, ...], int, int]:
@@ -44,16 +54,14 @@ def resolve_depformer_graph_settings(
     enforce_eager = bool(getattr(model_config, "enforce_eager", False))
     enabled = enabled and not enforce_eager
     compilation = getattr(vllm_config, "compilation_config", None)
-    raw_sizes = getattr(compilation, "cudagraph_capture_sizes", None)
     warmup = getattr(compilation, "cudagraph_num_of_warmups", None)
     warm_iters = default_warmup_iters if warmup is None else max(warmup, 0)
-    sizes = raw_sizes if raw_sizes else default_sizes
-    scheduler = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = getattr(scheduler, "max_num_seqs", 0)
-    max_batch = max(max(sizes), max_num_seqs, 1)
-    if not enabled:
-        max_batch = max(max_batch, default_max_batch)
-    return enabled, tuple(sizes), max_batch, warm_iters
+    # Assume one live duplex session contributes at most 1 row per tick
+    # then duplex_max_sessions is the real batch ceiling
+    max_batch = getattr(model_config, "duplex_max_sessions", None)
+    max_batch = max(int(max_batch), 1) if max_batch else default_max_batch
+    sizes = _capture_sizes_up_to(max_batch)
+    return enabled, sizes, max_batch, warm_iters
 
 
 @dataclass
