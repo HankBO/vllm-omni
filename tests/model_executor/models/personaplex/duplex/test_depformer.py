@@ -17,6 +17,7 @@ from tests.model_executor.models.personaplex.duplex._depformer_testing import (
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer_cudagraph import (
     CUDAGraphDepformerWrapper,
+    _EagerReason,
     resolve_depformer_graph_settings,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import PersonaPlexTalkerForConditionalGeneration
@@ -82,6 +83,55 @@ def test_cpu_warmup_does_not_capture() -> None:
     wrapper(text, hidden, audio_tokens=tokens, audio_provided=provided)
     assert wrapper.stats.eager == 1
     assert wrapper.stats.replays == 0
+
+
+class _CudaTensorMetadata:
+    def __init__(self, shape: tuple[int, ...]) -> None:
+        self.shape = shape
+        self.ndim = len(shape)
+        self.dtype = torch.long
+        self.device = SimpleNamespace(type="cuda")
+
+
+class _MismatchedGraphEntry:
+    _warned = False
+
+    def matches(self, *_args) -> bool:
+        return False
+
+
+@pytest.mark.parametrize(
+    ("enabled", "capture_sizes", "text_token", "has_graph", "expected_reason"),
+    [
+        (False, [1], torch.zeros(1, dtype=torch.long), False, _EagerReason.DISABLED),
+        (True, [1], torch.zeros(1, dtype=torch.long), False, _EagerReason.NON_CUDA),
+        (True, [1], _CudaTensorMetadata((2,)), False, _EagerReason.NO_CAPTURE_SIZE),
+        (True, [1], _CudaTensorMetadata((1,)), False, _EagerReason.GRAPH_MISSING),
+        (True, [1], _CudaTensorMetadata((1,)), True, _EagerReason.INPUT_MISMATCH),
+    ],
+)
+def test_resolve_replay_entry_returns_eager_reason(
+    enabled: bool,
+    capture_sizes: list[int],
+    text_token: torch.Tensor,
+    has_graph: bool,
+    expected_reason: _EagerReason,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = make_depformer()
+    wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=capture_sizes, enabled=enabled)
+    if has_graph:
+        wrapper._graphs[1] = _MismatchedGraphEntry()
+
+    _entry, reason = wrapper._resolve_replay_entry(
+        text_token,
+        torch.zeros(1, 1, model.temporal_hidden_size),
+        None,
+        None,
+    )
+
+    assert reason is expected_reason
 
 
 def test_resolve_depformer_graph_settings_uses_compilation_and_max_seqs() -> None:

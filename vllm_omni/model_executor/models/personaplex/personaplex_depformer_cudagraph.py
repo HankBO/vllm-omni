@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
     PersonaPlexDepformer,
@@ -76,8 +76,19 @@ class DepformerCUDAGraphStats:
         }
 
 
+class _EagerReason(Enum):
+    """Why a call fell back to eager instead of replaying a captured graph."""
+
+    DISABLED = "disabled"
+    NON_CUDA = "non_cuda"
+    OUTER_CAPTURE = "outer_capture"
+    NO_CAPTURE_SIZE = "no_capture_size"
+    GRAPH_MISSING = "graph_missing"
+    INPUT_MISMATCH = "input_mismatch"
+
+
 @dataclass
-class _CaptureDepformerGraph:
+class _DepformerCUDAGraph:
     graph: torch.cuda.CUDAGraph
     padded_b: int
     static_text_token: torch.Tensor
@@ -157,6 +168,7 @@ class CUDAGraphDepformerWrapper:
         capture_sizes: Sequence[int],
         enabled: bool = True,
         warmup_iters: int = 3,
+        num_steps: int | None = None,
     ) -> None:
         sizes = sorted({int(size) for size in capture_sizes if int(size) > 0})
         if not sizes:
@@ -165,9 +177,12 @@ class CUDAGraphDepformerWrapper:
         self.capture_sizes: tuple[int, ...] = tuple(sizes)
         self.enabled = enabled
         self.warmup_iters = warmup_iters
-        self._graphs: dict[int, _CaptureDepformerGraph] = {}
+        self._graphs: dict[int, _DepformerCUDAGraph] = {}
         self._stats = DepformerCUDAGraphStats()
         self._warmed_up = False
+        self.num_steps = self.depformer.dep_q if num_steps is None else int(num_steps)
+        if not 1 <= self.num_steps <= self.depformer.dep_q:
+            raise ValueError(f"num_steps must be in [1, {self.depformer.dep_q}]; got {num_steps}")
 
     @property
     def stats(self) -> DepformerCUDAGraphStats:
@@ -185,7 +200,7 @@ class CUDAGraphDepformerWrapper:
     def _select_padded_b(self, actual_b: int) -> int | None:
         return next((size for size in self.capture_sizes if size >= actual_b), None)
 
-    def _synthetic_kwards(self, padded_b: int, device: torch.device) -> dict[str, torch.Tensor]:
+    def _synthetic_kwargs(self, padded_b: int, device: torch.device) -> dict[str, torch.Tensor]:
         dep_q = self.depformer.dep_q
         dtype = next(self.depformer.parameters()).dtype
         hidden = self.depformer.temporal_hidden_size
@@ -203,12 +218,18 @@ class CUDAGraphDepformerWrapper:
         audio_tokens: torch.Tensor | None,
         audio_provided: torch.Tensor | None,
     ) -> torch.Tensor:
-        out = self.depformer(text_token, transformer_out, audio_tokens, audio_provided)
+        out = self.depformer(
+            text_token,
+            transformer_out,
+            audio_tokens,
+            audio_provided,
+            num_steps=self.num_steps,
+        )
         if isinstance(out, tuple):
             return out[0]
         return out
 
-    def _capture_one(self, padded_b: int, device: torch.device) -> _CaptureDepformerGraph | None:
+    def _capture_model(self, padded_b: int, device: torch.device) -> _DepformerCUDAGraph | None:
         if padded_b > self.depformer.max_graph_batch_size:
             logger.warning(
                 "Cannot capture Depformer graph for padded batch size %d > max_graph_batch_size %d",
@@ -217,25 +238,19 @@ class CUDAGraphDepformerWrapper:
             )
             self.stats.capture_failure += 1
             return None
-        kwargs = self._synthetic_kwards(padded_b, device)
+
+        kwargs = self._synthetic_kwargs(padded_b, device)
+        # Warmup and capture replay the same eager path so the recorded graph
+        # is provably what `_eager()` would have computed for these inputs.
         try:
+            pool = torch.cuda.graph_pool_handle()
             with torch.inference_mode(False), torch.no_grad():
                 for _ in range(max(self.warmup_iters, 0)):
-                    self.depformer(
-                        kwargs["text_token"],
-                        kwargs["transformer_out"],
-                        kwargs["audio_tokens"],
-                        kwargs["audio_provided"],
-                    )
+                    self._eager(**kwargs)
                 torch.accelerator.synchronize(device)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                    static_out = self.depformer(
-                        kwargs["text_token"],
-                        kwargs["transformer_out"],
-                        kwargs["audio_tokens"],
-                        kwargs["audio_provided"],
-                    )
+                with torch.cuda.graph(graph, pool=pool):
+                    static_out = self._eager(**kwargs)
                 torch.accelerator.synchronize(device)
         except Exception as exc:
             logger.warning(
@@ -245,10 +260,8 @@ class CUDAGraphDepformerWrapper:
             )
             self.stats.capture_failure += 1
             return None
-        if isinstance(static_out, tuple):
-            static_out = static_out[0]
         logger.info("Captured Depformer graph for padded batch size %d", padded_b)
-        return _CaptureDepformerGraph(
+        return _DepformerCUDAGraph(
             graph=graph,
             padded_b=padded_b,
             static_text_token=kwargs["text_token"],
@@ -274,9 +287,41 @@ class CUDAGraphDepformerWrapper:
             return
         self._warmed_up = True
         for padded_b in self.capture_sizes:
-            entry = self._capture_one(padded_b, device)
+            entry = self._capture_model(padded_b, device)
             if entry is not None:
                 self._graphs[padded_b] = entry
+
+    def _resolve_replay_entry(
+        self,
+        text_token: torch.Tensor,
+        transformer_out: torch.Tensor,
+        audio_tokens: torch.Tensor | None,
+        audio_provided: torch.Tensor | None,
+    ) -> tuple[_DepformerCUDAGraph | None, _EagerReason | None]:
+        """Pick the captured graph for this call, or why eager is required."""
+        if not self.enabled:
+            return None, _EagerReason.DISABLED
+        if text_token.device.type != "cuda":
+            return None, _EagerReason.NON_CUDA
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return None, _EagerReason.OUTER_CAPTURE
+
+        padded_b = self._select_padded_b(text_token.shape[0])
+        if padded_b is None:
+            return None, _EagerReason.NO_CAPTURE_SIZE
+        entry = self._graphs.get(padded_b)
+        if entry is None:
+            return None, _EagerReason.GRAPH_MISSING
+        if not entry.matches(text_token, transformer_out, audio_tokens, audio_provided):
+            if not entry._warned:
+                logger.warning(
+                    "Depformer graph input mismatch for padded batch size %d; "
+                    "using eager execution. This warning is only logged once.",
+                    padded_b,
+                )
+                entry._warned = True
+            return None, _EagerReason.INPUT_MISMATCH
+        return entry, None
 
     def __call__(
         self,
@@ -286,34 +331,14 @@ class CUDAGraphDepformerWrapper:
         audio_provided: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.stats.calls += 1
-        capturing = False
-        if text_token.device.type == "cuda" and torch.cuda.is_available():
-            capturing = torch.cuda.is_current_stream_capturing()
-        if not self.enabled or text_token.device.type != "cuda" or capturing:
-            self.stats.eager += 1
-            if capturing:
-                self.stats.eager_outer_capture += 1
-            return self._eager(text_token, transformer_out, audio_tokens, audio_provided)
-
-        actual_b = text_token.shape[0]
-        padded_b = self._select_padded_b(actual_b)
-        entry = self._graphs.get(padded_b) if padded_b is not None else None
+        entry, reason = self._resolve_replay_entry(text_token, transformer_out, audio_tokens, audio_provided)
         if entry is None:
             self.stats.eager += 1
-            if padded_b is None:
+            if reason is _EagerReason.OUTER_CAPTURE:
+                self.stats.eager_outer_capture += 1
+            elif reason in (_EagerReason.NO_CAPTURE_SIZE, _EagerReason.INPUT_MISMATCH):
                 self.stats.eager_shape_mismatch += 1
-            return self._eager(text_token, transformer_out, audio_tokens, audio_provided)
-        if not entry.matches(text_token, transformer_out, audio_tokens, audio_provided):
-            self.stats.eager += 1
-            self.stats.eager_shape_mismatch += 1
-            if not entry._warned:
-                logger.warning(
-                    "Depformer graph input mismatch for padded batch size %d; "
-                    "using eager execution. This warning is only logged once.",
-                    padded_b,
-                )
-                entry._warned = True
             return self._eager(text_token, transformer_out, audio_tokens, audio_provided)
 
         self.stats.replays += 1
-        return entry.replay(text_token, transformer_out, audio_tokens, audio_provided, actual_b)
+        return entry.replay(text_token, transformer_out, audio_tokens, audio_provided, int(text_token.shape[0]))
