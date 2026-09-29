@@ -105,7 +105,7 @@ def test_capture_failure_stays_eager(cuda_device: torch.device, monkeypatch: pyt
         self.stats.capture_failure += 1
         return None
 
-    monkeypatch.setattr(CUDAGraphDepformerWrapper, "_capture_one", _fail)
+    monkeypatch.setattr(CUDAGraphDepformerWrapper, "_capture_model", _fail)
     wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1], warmup_iters=1)
     wrapper.warmup(cuda_device)
     assert not wrapper.is_ready
