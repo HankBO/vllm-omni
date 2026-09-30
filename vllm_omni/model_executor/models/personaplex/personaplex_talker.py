@@ -29,7 +29,10 @@ encode of the input WAV (built in ``preprocess``); live duplex is Phase 2.
 
 from __future__ import annotations
 
+import atexit
+import os
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -59,6 +62,47 @@ from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
 )
 
 __all__ = ["PersonaPlexTalkerForConditionalGeneration"]
+
+# Manual parity capture only. Unset means no dump
+PERSONAPLEX_DEPFORMER_DUMP = "tmp/pplex-depformer.pt"
+_DEPFORMER_DUMP_EVERY = 16
+_depformer_dump_frames: list[dict[str, Any]] = []
+_depformer_dump_registered = False
+
+
+def _flush_depformer_dump() -> None:
+    path = PERSONAPLEX_DEPFORMER_DUMP
+    if not path or not _depformer_dump_frames:
+        return
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"frames": _depformer_dump_frames}, out)
+
+
+def _record_depformer_dump(
+    *,
+    text_token: torch.Tensor,
+    hidden: torch.Tensor,
+    audio_tokens: torch.Tensor | None,
+    audio_provided: torch.Tensor | None,
+    num_steps: int,
+) -> None:
+    global _depformer_dump_registered
+    if not _depformer_dump_registered:
+        atexit.register(_flush_depformer_dump)
+        _depformer_dump_registered = True
+    _depformer_dump_frames.append(
+        {
+            "text_token": text_token.detach().to("cpu"),
+            "hidden": hidden.detach().to("cpu"),
+            "audio_tokens": None if audio_tokens is None else audio_tokens.detach().to("cpu"),
+            "audio_provided": None if audio_provided is None else audio_provided.detach().to("cpu"),
+            "num_steps": num_steps,
+        }
+    )
+    if len(_depformer_dump_frames) % _DEPFORMER_DUMP_EVERY == 0:
+        print("dumping depformer frames into .pt")
+        _flush_depformer_dump()
 
 
 class PersonaPlexTalkerForConditionalGeneration(nn.Module):
@@ -621,6 +665,17 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """Dispatch to the CUDA-graph wrapper when captured, else eager."""
         self._maybe_init_depformer_graphs()
+        if self._depformer_graph is not None:
+            steps = self._depformer_graph.num_steps
+        else:
+            steps = self.depformer.dep_q if num_steps is None else int(num_steps)
+        _record_depformer_dump(
+            text_token=text_token,
+            hidden=hidden,
+            audio_tokens=audio_tokens,
+            audio_provided=audio_provided,
+            num_steps=steps,
+        )
         if self._depformer_graph is not None:
             return self._depformer_graph(
                 text_token,
