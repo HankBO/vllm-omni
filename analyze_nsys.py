@@ -26,7 +26,7 @@ Capture (use the lifecycle e2e driver on main):
     Rows are NVTX wall time, not kernel sums. Kernel sums are not comparable
     when the capture used the default --cuda-graph-trace=graph.
 
-    python analyze_nsys.py /tmp/pplex-nsys
+    python analyze_nsys.py tmp/pplex-nsys
 
     Pair graphs off vs on by filename. A shared case key is what remains after
     removing eager/off or graphs/on, so eager_n16 and graphs_n16 compare.
@@ -36,8 +36,10 @@ Capture (use the lifecycle e2e driver on main):
 """
 
 import argparse
+import io
 import sqlite3
 import subprocess
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import regex as re
@@ -241,7 +243,7 @@ def _mode_and_key(trace_name) -> tuple[str, str] | None:
 
 def _case_sort_key(case_key: str) -> tuple[int, str]:
     numbers = re.findall(r"\d+", case_key)
-    return (int[numbers[-1]] if numbers else 10**9, case_key)
+    return (int(numbers[-1]) if numbers else 10**9, case_key)
 
 
 def _print_table(headers, rendered) -> None:
@@ -296,7 +298,7 @@ def _print_on_off_table(rows):
                 _fmt(off.get("step_over_tick") if off else None),
                 _fmt(on.get("step_over_tick") if on else None),
                 _fmt(off.get("depformer_med_ms") if off else None),
-                _fmt(on.get("depformer_med_ms") if off else None, 1),
+                _fmt(on.get("depformer_med_ms") if on else None, 1),
                 _fmt(off.get("depformer_replays_per_tick") if off else None, 1),
                 _fmt(on.get("depformer_replays_per_tick") if on else None, 1),
             ]
@@ -471,10 +473,27 @@ if __name__ == "__main__":
     )
     parser.add_argument("path", help="One .sqlite file, or a directory of .sqlite / .nsys-rep traces.")
     parser.add_argument("--tick_ms", type=float, default=80.0, help="Duplex tick cycle duration in ms (default: 80.0)")
+    parser.add_argument(
+        "--output-file",
+        type=Path,
+        help="Also save the formatted analysis report to this file.",
+    )
     args = parser.parse_args()
 
     target = Path(args.path)
-    if target.is_dir():
-        summarize_nsys_dir(target, args.tick_ms)
+    if args.output_file is None:
+        if target.is_dir():
+            summarize_nsys_dir(target, args.tick_ms)
+        else:
+            analyze_nsys_sqlite(str(target), args.tick_ms)
     else:
-        analyze_nsys_sqlite(str(target), args.tick_ms)
+        report = io.StringIO()
+        with redirect_stdout(report):
+            if target.is_dir():
+                summarize_nsys_dir(target, args.tick_ms)
+            else:
+                analyze_nsys_sqlite(str(target), args.tick_ms)
+        formatted_report = report.getvalue()
+        print(formatted_report, end="")
+        args.output_file.parent.mkdir(parents=True, exist_ok=True)
+        args.output_file.write_text(formatted_report, encoding="utf-8")
