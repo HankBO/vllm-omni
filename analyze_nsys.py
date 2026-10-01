@@ -22,12 +22,25 @@ Capture (use the lifecycle e2e driver on main):
     nsys export --type sqlite --output personaplex_main_b2_baseline.sqlite personaplex_main_b2_baseline.nsys-rep
     python analyze_nsys.py personaplex_main_b2_baseline.sqlite
 
+    A directory of traces (graphs on vs off, one file per N) prints one table.
+    Rows are NVTX wall time, not kernel sums. Kernel sums are not comparable
+    when the capture used the default --cuda-graph-trace=graph.
+
+    python analyze_nsys.py /tmp/pplex-nsys
+
+    Pair graphs off vs on by filename. A shared case key is what remains after
+    removing eager/off or graphs/on, so eager_n16 and graphs_n16 compare.
+
     The server records ticks 20-120 via torch.cuda.profiler.start/stop in gpu_ar_model_runner.
     Segment kernel counts use launch correlation (runtime correlationId).
 """
 
 import argparse
 import sqlite3
+import subprocess
+from pathlib import Path
+
+import regex as re
 
 ANCHOR_MARKER = "personaplex_sample_and_depformer"
 SEGMENT_MARKERS = (
@@ -94,6 +107,243 @@ def _correlated_for_nvtx(
             graph_replays += 1
         kernels += len(kernel_by_corr.get(corr_id, []))
     return kernels, launches, graph_replays
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _ms(start: int, end: int) -> float:
+    return (end - start) / 1e6
+
+
+def _stage0_step_ms(temporal: list[tuple[int, int]], depformer: list[tuple[int, int]]):
+    """Wall time from the start of temporal forward to the end of the depformer range."""
+    if not temporal or not depformer or len(temporal) != len(depformer):
+        return []
+    steps = []
+    for (temporal_start, _), (_, depformer_end) in zip(sorted(temporal), sorted(depformer)):
+        if depformer_end >= temporal_start:
+            steps.append(_ms(temporal_start, depformer_end))
+    return steps
+
+
+def _trace_wall_row(db_path, tick_ms):
+    """Per-step Stage 0 wall times from NVTX. Does not use kernel-sum GPU active time."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+    except sqlite3.Error as exc:
+        print(f"{db_path.name}: cannot open ({exc})")
+        return None
+    if not _table_exists(cursor, "NVTX_EVENTS"):
+        print(f"{db_path.name}: no NVTX_EVENTS table")
+        conn.close()
+        return None
+    ranges = _load_nvtx_ranges(cursor, SEGMENT_MARKERS)
+    temporal = ranges.get("personaplex_temporal_forward", [])
+    depformer = ranges.get(ANCHOR_MARKER, [])
+    temporal_ms = [_ms(start, end) for start, end in temporal]
+    depformer_ms = [_ms(start, end) for start, end in depformer]
+    step_ms = _stage0_step_ms(temporal, depformer)
+    replays = None
+    if _table_exists(cursor, "CUPTI_ACTIVITY_KIND_RUNTIME"):
+        runtime_rows = _load_runtime_rows(cursor)
+        kernel_by_corr = {}
+        if _table_exists(cursor, "CUPTI_ACTIVITY_KIND_KERNEL"):
+            kernel_by_corr = _load_kernel_by_correlation(cursor)
+        total_replays = 0
+        for start, end in depformer:
+            _, _, graph_n = _correlated_for_nvtx(start, end, runtime_rows, kernel_by_corr)
+            total_replays += graph_n
+        replays = total_replays / len(depformer) if depformer else 0.0
+    conn.close()
+    step_med = _median(step_ms)
+    return {
+        "trace": db_path.stem,
+        "ticks": len(depformer),
+        "temporal_med_ms": _median(temporal_ms),
+        "depformer_med_ms": _median(depformer_ms),
+        "stage0_step_med_ms": step_med,
+        "stage0_step_max_ms": max(step_ms) if step_ms else None,
+        "step_over_tick": (step_med / tick_ms) if step_med is not None and tick_ms else None,
+        "depformer_replays_per_tick": replays,
+    }
+
+
+def _export_sqlite(nsys_rep: Path) -> Path | None:
+    sqlite_path = nsys_rep.with_suffix(".sqlite")
+    if sqlite_path.is_file():
+        return sqlite_path
+    try:
+        subprocess.run(
+            ["nsys", "export", "--type", "sqlite", "--output", str(sqlite_path), str(nsys_rep)],
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"{nsys_rep.name}: sqlite export failed ({exc})")
+        return None
+    return sqlite_path if sqlite_path.is_file() else None
+
+
+def _sqlite_paths(directory: Path) -> list[Path]:
+    paths: list[Path] = []
+    for sqlite_path in sorted(directory.rglob("*.sqlite")):
+        paths.append(sqlite_path)
+    known = {path.with_suffix("") for path in paths}
+    for nsys_rep in sorted(directory.rglob("*.nsys-rep")):
+        if nsys_rep.with_suffix("") in known:
+            continue
+        exported = _export_sqlite(nsys_rep)
+        if exported is not None:
+            paths.append(exported)
+    return paths
+
+
+def _fmt(value: object, digits: int = 2) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+_OFF_TOKENS = {"eager_depformer", "graphs_off", "graph_off", "eager", "off"}
+_ON_TOKENS = {"graphs_on", "graph_on", "graphs", "on"}
+
+
+def _mode_and_key(trace_name) -> tuple[str, str] | None:
+    """Split `eager_n16` / `graphs_n16` into a mode and the shared case key."""
+    stem = Path(trace_name).name.lower()
+    mode = None
+    for token in _OFF_TOKENS:
+        if token in stem:
+            mode = "off"
+            stem = stem.replace(token, " ")
+            break
+    if mode is None:
+        for token in _ON_TOKENS:
+            if token in stem:
+                mode = "on"
+                stem = stem.replace(token, " ")
+                break
+    if mode is None:
+        return None
+    key = re.sub(r"[^a-z0-9]+", "", stem) or trace_name
+    return mode, key
+
+
+def _case_sort_key(case_key: str) -> tuple[int, str]:
+    numbers = re.findall(r"\d+", case_key)
+    return (int[numbers[-1]] if numbers else 10**9, case_key)
+
+
+def _print_table(headers, rendered) -> None:
+    widths = [len(header) for header in headers]
+    for line in rendered:
+        for index, cell in enumerate(line):
+            widths[index] = max(widths[index], len(cell))
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    for line in rendered:
+        print("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(line)))
+
+
+def _print_on_off_table(rows):
+    grouped = {}
+    for row in rows:
+        parsed = _mode_and_key(str(row["trace"]))
+        if parsed is None:
+            continue
+        mode, case_key = parsed
+        grouped.setdefault(case_key, {})[mode] = row
+    if not grouped:
+        print("No graphs-on/off pair.")
+        return
+    headers = (
+        "case",
+        "off_step_med_ms",
+        "on_step_med_ms",
+        "delta_ms",
+        "off_step/80",
+        "on_step/80",
+        "off_depformer_med_ms",
+        "on_depformer_med_ms",
+        "off_replays/tick",
+        "on_replays/tick",
+    )
+    rendered = []
+    for case_key in sorted(grouped, key=_case_sort_key):
+        pair = grouped[case_key]
+        off = pair.get("off")
+        on = pair.get("on")
+        off_step = off.get("stage0_step_med_ms") if off else None
+        on_step = on.get("stage0_step_med_ms") if on else None
+        delta = None
+        if isinstance(off_step, float) and isinstance(on_step, float):
+            delta = on_step - off_step
+        rendered.append(
+            [
+                case_key,
+                _fmt(off_step),
+                _fmt(on_step),
+                _fmt(delta),
+                _fmt(off.get("step_over_tick") if off else None),
+                _fmt(on.get("step_over_tick") if on else None),
+                _fmt(off.get("depformer_med_ms") if off else None),
+                _fmt(on.get("depformer_med_ms") if off else None, 1),
+                _fmt(off.get("depformer_replays_per_tick") if off else None, 1),
+                _fmt(on.get("depformer_replays_per_tick") if on else None, 1),
+            ]
+        )
+    print("Graph off vs on. delta_ms is on minus off (negative means the graphed depformer step is faster).")
+    _print_table(headers, rendered)
+
+
+def summarize_nsys_dir(directory, tick_ms: float = 80.0) -> None:
+    """One row per trace, plus an on/off table when filenames mark the pair."""
+    rows = []
+    for db_path in _sqlite_paths(directory):
+        row = _trace_wall_row(db_path, tick_ms)
+        if row is not None:
+            row["trace"] = str(db_path.relative_to(directory).with_suffix(""))
+            rows.append(row)
+    if not rows:
+        print(f"No nsys sqlite traces in {directory}")
+        return
+    print(
+        "Stage 0 step is NVTX wall time from personaplex temporal_forward start "
+        "to personaplex_sample_and_depformer end."
+    )
+    _print_on_off_table(rows)
+    print()
+    headers = (
+        "trace",
+        "ticks",
+        "temporal_med_ms",
+        "depformer_med_ms",
+        "stage0_step_med_ms",
+        "stage0_step_max_ms",
+        "step/80",
+        "depformer_replays/tick",
+    )
+    keys = (
+        "trace",
+        "ticks",
+        "temporal_med_ms",
+        "depformer_med_ms",
+        "stage0_step_med_ms",
+        "stage0_step_max_ms",
+        "step_over_tick",
+        "depformer_replays_per_tick",
+    )
+    rendered = [[_fmt(row[key], 1 if key == "depformer_replays_per_tick" else 2) for key in keys] for row in rows]
+    _print_table(headers, rendered)
 
 
 def analyze_nsys_sqlite(db_path, tick_ms=80.0):
@@ -219,8 +469,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Analyze Nsys SQLite export for GPU Idle fraction and NVTX kernel counts."
     )
-    parser.add_argument("db_path", help="Path to the SQLite database file (e.g., my_profile.sqlite)")
+    parser.add_argument("path", help="One .sqlite file, or a directory of .sqlite / .nsys-rep traces.")
     parser.add_argument("--tick_ms", type=float, default=80.0, help="Duplex tick cycle duration in ms (default: 80.0)")
     args = parser.parse_args()
 
-    analyze_nsys_sqlite(args.db_path, args.tick_ms)
+    target = Path(args.path)
+    if target.is_dir():
+        summarize_nsys_dir(target, args.tick_ms)
+    else:
+        analyze_nsys_sqlite(str(target), args.tick_ms)

@@ -53,8 +53,6 @@ stages:
     max_model_len: 3000
     devices: "0"
     enforce_eager: false
-    hf_overrides:
-      depformer_cuda_graphs: true
     compilation_config:
       cudagraph_num_of_warmups: 3
     output_connectors:
