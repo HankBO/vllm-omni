@@ -166,13 +166,22 @@ aborted scheduler request resets and returns only that session's encoder.
 
 ### Stage 0 CUDA graphs
 
-The AR runner FULL-graphs Helium. The depformer is launch-bound (16-step
-unroll), so `CUDAGraphDepformerWrapper` captures `PersonaPlexDepformer.forward`
-per padded batch with statc KV. Sizes come from Stage 0
-`compilation_config.cudagraph_capture_sizes.`. `personaplex.yaml` sets
-`hf_overrides.depformer_cuda_graphs: true`. `enforce_eager: true` disables graphs.
-Shape mismatch or capture failure replays eager. Graphed vs eager codes are tested
-in `tests/model_executor/models/personaplex/duplex/`;
+The AR runner FULL-graphs Helium. Separately, `CUDAGraphDepformerWrapper`
+captures `PersonaPlexDepformer.forward` for each padded batch size, using static
+KV buffers. The model has 16 depformer codebooks, but serving captures and runs
+eight steps: the talker passes `num_active_codebooks` (8) to the wrapper, matching
+the eight agent-audio codebooks consumed by the serving path.
+
+Capture sizes are derived from `model_config.duplex_max_sessions`, the maximum
+number of live duplex sessions (with a default ceiling of 32 when it is unset).
+The wrapper captures powers of two up to that ceiling and also the exact ceiling
+when it is not itself a power of two. The ceiling is an upper bound; for example,
+a value of 6 produces capture sizes 1, 2, 4, and 6. The depformer does not use
+`compilation_config.cudagraph_capture_sizes` for this policy. `personaplex.yaml`
+enables the wrapper with `hf_overrides.depformer_cuda_graphs: true`;
+`enforce_eager: true` disables it. Shape mismatch or capture failure falls back
+to eager execution. Graphed versus eager codes are tested in
+`tests/model_executor/models/personaplex/duplex/`.
 
 ### Stage 1 streaming decoder
 
