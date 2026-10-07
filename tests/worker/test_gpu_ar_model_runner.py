@@ -144,9 +144,10 @@ def test_post_sample_talker_mtp_skips_stale_epoch_after_metadata_merge() -> None
     talker._depformer_graphs_enabled = False
     talker._depformer_graph = None
     talker._personaplex_duplex_stage0_runtime = SimpleNamespace(
-        record_sample=lambda *, request_id, text_token, agent_codes: recorded.append(
-            (request_id, text_token.clone(), agent_codes.clone())
-        )
+        prepared_depformer_state=lambda request_id: None,
+        record_sample=lambda *, request_id, text_token, effective_codes: recorded.append(
+            (request_id, text_token.clone(), effective_codes.clone())
+        ),
     )
     talker.gpu_resident_buffer_keys = set()
 
