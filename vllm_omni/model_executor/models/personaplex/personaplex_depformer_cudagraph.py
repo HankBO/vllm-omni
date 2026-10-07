@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
     PersonaPlexDepformer,
+    _DepformerKVBuffers,
 )
 
 logger = init_logger(__name__)
@@ -49,7 +50,7 @@ def resolve_depformer_graph_settings(
     enabled: bool,
     default_max_batch: int = 32,
     default_warmup_iters: int = 3,
-) -> tuple[bool, tuple[int, ...], int, int]:
+) -> tuple[bool, tuple[int, ...], int]:
     model_config = getattr(vllm_config, "model_config", None)
     enforce_eager = bool(getattr(model_config, "enforce_eager", False))
     enabled = enabled and not enforce_eager
@@ -61,7 +62,7 @@ def resolve_depformer_graph_settings(
     max_batch = getattr(model_config, "duplex_max_sessions", None)
     max_batch = max(int(max_batch), 1) if max_batch else default_max_batch
     sizes = _capture_sizes_up_to(max_batch)
-    return enabled, sizes, max_batch, warm_iters
+    return enabled, sizes, warm_iters
 
 
 @dataclass
@@ -191,6 +192,20 @@ class CUDAGraphDepformerWrapper:
         self.num_steps = self.depformer.dep_q if num_steps is None else int(num_steps)
         if not 1 <= self.num_steps <= self.depformer.dep_q:
             raise ValueError(f"num_steps must be in [1, {self.depformer.dep_q}]; got {num_steps}")
+        self._graph_kv_buffers: _DepformerKVBuffers | None = None
+        if self.enabled:
+            param = next(self.depformer.parameters())
+            config = self.depformer.config
+            # Size fixed scratch storage for the largest graph this wrapper can replay.
+            self._graph_kv_buffers = _DepformerKVBuffers(
+                num_layers=config.num_hidden_layers,
+                max_batch=max(self.capture_sizes),
+                num_heads=config.num_attention_heads,
+                dep_q=config.dep_q,
+                head_dim=config.head_dim,
+                device=param.device,
+                dtype=param.dtype,
+            )
 
     @property
     def stats(self) -> DepformerCUDAGraphStats:
@@ -225,6 +240,8 @@ class CUDAGraphDepformerWrapper:
         transformer_out: torch.Tensor,
         audio_tokens: torch.Tensor | None,
         audio_provided: torch.Tensor | None,
+        *,
+        graph_kv_buffers: _DepformerKVBuffers | None = None,
     ) -> torch.Tensor:
         out = self.depformer(
             text_token,
@@ -232,33 +249,28 @@ class CUDAGraphDepformerWrapper:
             audio_tokens,
             audio_provided,
             num_steps=self.num_steps,
+            graph_kv_buffers=graph_kv_buffers,
         )
         if isinstance(out, tuple):
             return out[0]
         return out
 
     def _capture_model(self, padded_b: int, device: torch.device) -> _DepformerCUDAGraph | None:
-        if padded_b > self.depformer.max_graph_batch_size:
-            logger.warning(
-                "Cannot capture Depformer graph for padded batch size %d > max_graph_batch_size %d",
-                padded_b,
-                self.depformer.max_graph_batch_size,
-            )
-            self.stats.capture_failure += 1
-            return None
-
         kwargs = self._synthetic_kwargs(padded_b, device)
+        graph_kv_buffers = self._graph_kv_buffers
+        if graph_kv_buffers is None:
+            raise RuntimeError("Depformer graph KV buffers are not initialized")
         # Warmup and capture replay the same eager path so the recorded graph
         # is provably what `_eager()` would have computed for these inputs.
         try:
             pool = torch.cuda.graph_pool_handle()
             with torch.inference_mode(False), torch.no_grad():
                 for _ in range(max(self.warmup_iters, 0)):
-                    self._eager(**kwargs)
+                    self._eager(**kwargs, graph_kv_buffers=graph_kv_buffers)
                 torch.accelerator.synchronize(device)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=pool):
-                    static_out = self._eager(**kwargs)
+                    static_out = self._eager(**kwargs, graph_kv_buffers=graph_kv_buffers)
                 torch.accelerator.synchronize(device)
         except Exception as exc:
             logger.warning(
@@ -316,6 +328,7 @@ class CUDAGraphDepformerWrapper:
 
         padded_b = self._select_padded_b(text_token.shape[0])
         if padded_b is None:
+            # fallback to eager mode if no suitable cudagraph size found
             return None, _EagerReason.NO_CAPTURE_SIZE
         entry = self._graphs.get(padded_b)
         if entry is None:

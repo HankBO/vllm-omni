@@ -51,6 +51,23 @@ def test_kv_reset_isolates_successive_frames() -> None:
     torch.testing.assert_close(streamed_second, only_second, rtol=0, atol=0)
 
 
+def test_graph_kv_buffers_support_batch_smaller_than_capacity() -> None:
+    model = make_depformer(seed=12)
+    wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1, 2, 4], enabled=True)
+    text_token, hidden, audio_tokens, audio_provided = frame(batch=1, seed=13)
+
+    expected = model(text_token, hidden, audio_tokens=audio_tokens, audio_provided=audio_provided)
+    actual = model(
+        text_token,
+        hidden,
+        audio_tokens=audio_tokens,
+        audio_provided=audio_provided,
+        graph_kv_buffers=wrapper._graph_kv_buffers,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_wrapper_selects_smallest_capture_size_that_fits() -> None:
     model = make_depformer()
     wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1, 2, 4, 8], enabled=False)
@@ -62,6 +79,8 @@ def test_wrapper_selects_smallest_capture_size_that_fits() -> None:
 def test_disabled_wrapper_stays_eager() -> None:
     model = make_depformer(seed=9)
     wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1, 2], enabled=False)
+    assert wrapper._graph_kv_buffers is None
+    assert not hasattr(model, "kv_buffers")
     wrapper.warmup(torch.device("cpu"))
     text, hidden, tokens, provided = frame(batch=1, seed=10)
     out_wrap = wrapper(text, hidden, audio_tokens=tokens, audio_provided=provided)
@@ -140,11 +159,9 @@ def test_resolve_depformer_graph_settings_derives_sizes_from_duplex_max_sessions
         compilation_config=SimpleNamespace(cudagraph_num_of_warmups=1),
         scheduler_config=SimpleNamespace(max_num_seqs=10),
     )
-    enabled, sizes, max_batch, warmup = resolve_depformer_graph_settings(vllm_config, enabled=True)
+    enabled, sizes, warmup = resolve_depformer_graph_settings(vllm_config, enabled=True)
     assert enabled is True
     assert sizes == (1, 2, 4, 8, 10)
-    assert max_batch == 10
-    assert sizes[-1] == max_batch
     assert warmup == 1
 
 
@@ -181,6 +198,35 @@ def test_run_depformer_uses_eager_module_when_graphs_disabled() -> None:
     )
     want = model(text, hidden, audio_tokens=tokens, audio_provided=provided)
     torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_eager_fallback_supports_batches_larger_than_graph_capacity() -> None:
+    model = make_depformer(seed=44)
+    wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1], enabled=True)
+    text, hidden, tokens, provided = frame(batch=2, seed=45)
+
+    eager = model(text, hidden, audio_tokens=tokens, audio_provided=provided)
+    fallback = wrapper(text, hidden, audio_tokens=tokens, audio_provided=provided)
+
+    torch.testing.assert_close(fallback, eager, rtol=0, atol=0)
+    assert fallback.shape == (2, model.dep_q)
+    assert wrapper.stats.eager == 1
+    assert wrapper.stats.replays == 0
+    assert wrapper._graph_kv_buffers.k.shape[1] == 1
+
+    one_text, one_hidden, one_tokens, one_provided = frame(batch=1, seed=46)
+    graph_storage = model(
+        one_text,
+        one_hidden,
+        audio_tokens=one_tokens,
+        audio_provided=one_provided,
+        graph_kv_buffers=wrapper._graph_kv_buffers,
+    )
+    dynamic_storage = model(one_text, one_hidden, audio_tokens=one_tokens, audio_provided=one_provided)
+    torch.testing.assert_close(graph_storage, dynamic_storage, rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="graph KV buffer capacity"):
+        model(text, hidden, audio_tokens=tokens, audio_provided=provided, graph_kv_buffers=wrapper._graph_kv_buffers)
 
 
 def test_talk_run_depformer_dispatches_to_wrapper() -> None:

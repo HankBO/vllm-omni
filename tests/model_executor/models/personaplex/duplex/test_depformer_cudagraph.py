@@ -74,7 +74,7 @@ def test_shape_divergence_falls_back_to_eager(cuda_device: torch.device) -> None
 
 
 def test_oversized_batch_falls_back_to_eager(cuda_device: torch.device) -> None:
-    model = make_depformer(cuda_device, max_graph_batch_size=8, seed=28)
+    model = make_depformer(cuda_device, seed=28)
     wrapper = CUDAGraphDepformerWrapper(model, capture_sizes=[1, 2], warmup_iters=1)
     wrapper.warmup(cuda_device)
     text, hidden, tokens, provided = frame(3, 29, cuda_device)

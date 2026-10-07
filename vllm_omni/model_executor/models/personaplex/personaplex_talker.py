@@ -108,7 +108,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         (
             self._depformer_graphs_enabled,
             self._depformer_capture_sizes,
-            depformer_max_batch,
             self._depformer_warmup_iters,
         ) = resolve_depformer_graph_settings(
             vllm_config,
@@ -121,7 +120,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             config.depformer_config,
             temporal_hidden_size=hidden,
             text_card=config.text_vocab_size,
-            max_graph_batch_size=depformer_max_batch,
         )
         self._depformer_graph: CUDAGraphDepformerWrapper | None = None
 
