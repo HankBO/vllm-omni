@@ -9,11 +9,18 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.personaplex.duplex._depformer_testing import (
+    CARD,
+    HIDDEN,
     TEMPORAL,
+    TEXT_CARD,
     clone_depformer,
     frame,
     make_depformer,
 )
+from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
+    PersonaPlexDepformerConfig,
+)
+from vllm_omni.model_executor.models.personaplex.personaplex_depformer import PersonaPlexDepformer
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer_cudagraph import (
     CUDAGraphDepformerWrapper,
 )
@@ -32,17 +39,56 @@ def cuda_device() -> torch.device:
 
 
 def test_graphed_depformer_matches_eager(cuda_device: torch.device) -> None:
-    eager = make_depformer(cuda_device, seed=20)
-    graphed_model = clone_depformer(eager, cuda_device)
-    wrapper = CUDAGraphDepformerWrapper(graphed_model, capture_sizes=[1, 2], warmup_iters=3)
+    dep_q = 16
+    num_steps = 8
+    config = PersonaPlexDepformerConfig(
+        hidden_size=HIDDEN,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        head_dim=8,
+        num_key_value_heads=4,
+        intermediate_size=64,
+        dep_q=dep_q,
+        num_active_codebooks=num_steps,
+        card=CARD,
+        rms_norm_eps=1e-8,
+    )
+
+    torch.manual_seed(20)
+    eager = PersonaPlexDepformer(config, temporal_hidden_size=TEMPORAL, text_card=TEXT_CARD).to(
+        device=cuda_device, dtype=torch.bfloat16
+    )
+    eager.eval()
+    graphed_model = PersonaPlexDepformer(
+        config, temporal_hidden_size=TEMPORAL, text_card=TEXT_CARD
+    ).to(device=cuda_device, dtype=torch.bfloat16)
+    graphed_model.load_state_dict(eager.state_dict())
+    graphed_model.eval()
+    wrapper = CUDAGraphDepformerWrapper(
+        graphed_model, capture_sizes=[2], warmup_iters=3, num_steps=num_steps
+    )
     wrapper.warmup(cuda_device)
     assert wrapper.is_ready
     assert wrapper.stats.capture_failure == 0
 
-    for batch, seed in [(1, 21), (2, 22), (1, 23)]:
-        text, hidden, tokens, provided = frame(batch, seed, cuda_device)
-        want = eager(text, hidden, audio_tokens=tokens, audio_provided=provided)
+    teacher_forcing_masks = (
+        [True, False, False, False, False, False, False, False],
+        [True, True, False, True, False, False, True, False],
+        [False, True, True, False, True, False, False, True],
+    )
+    for seed, active_mask in enumerate(teacher_forcing_masks, start=21):
+        generator = torch.Generator().manual_seed(seed)
+        text = torch.randint(0, TEXT_CARD, (1,), generator=generator).to(cuda_device)
+        hidden = torch.randn(1, 1, TEMPORAL, generator=generator).to(
+            device=cuda_device, dtype=torch.bfloat16
+        )
+        tokens = torch.randint(0, CARD, (1, dep_q), generator=generator).to(cuda_device)
+        provided = torch.zeros(1, dep_q, dtype=torch.bool, device=cuda_device)
+        provided[0, :num_steps] = torch.tensor(active_mask, device=cuda_device)
+        provided[0, num_steps:] = seed % 2 == 0
+        want = eager(text, hidden, audio_tokens=tokens, audio_provided=provided, num_steps=num_steps)
         got = wrapper(text, hidden, audio_tokens=tokens, audio_provided=provided)
+        assert got.shape == (1, num_steps)
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert wrapper.stats.replays == 3
     assert wrapper.stats.eager == 0
