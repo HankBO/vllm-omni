@@ -19,8 +19,7 @@ Faithful-port details (all measured from ``nvidia/personaplex-7b-v1``):
 * **Causal attention over all inner steps**: Moshi forces the depformer's
   ``context`` to None, so each step attends to every prior inner step (KV
   capacity == ``weights_per_step``); the KV cache is rebuilt every temporal frame
-  into a perallocated ``[max_batch, H, dep_q, Dh]`` buffer so that a CUDA-graph
-  replay can keep the same storage addresses.
+  into per-call eager storage or fixed CUDA-graph storage.
 * **fp32 RMSNorm** (``rms_norm_f32``, eps 1e-8) with the weight stored as
   ``alpha`` of shape ``[1, 1, dim]``.
 * **SiLU gating** MLP (Moshi ``ActivationGating``): ``linear_in`` projects to
@@ -90,11 +89,11 @@ class _ScaledEmbedding(nn.Embedding):
 
 
 class _DepformerKVBuffers(nn.Module):
-    """Per-layer preallocated attention KV for graph-safe replay.
+    """Per-layer attention KV storage for eager calls or graph-safe replay.
 
     The depformer is a small AR head that runs ``dep_q`` inner steps per temporal
-    frame, so its KV cache is reset every frame and only spans the inner steps.
-    Shape per layer: ``[max_batch, num_heads, dep_q, head_dim]``.
+    frame, so its KV cache only spans the inner steps. Shape per layer:
+    ``[batch, num_heads, dep_q, head_dim]``.
     """
 
     def __init__(
@@ -104,20 +103,23 @@ class _DepformerKVBuffers(nn.Module):
         num_heads: int,
         dep_q: int,
         head_dim: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         shape = (num_layers, max_batch, num_heads, dep_q, head_dim)
-        self.register_buffer("k", torch.empty(shape), persistent=False)
-        self.register_buffer("v", torch.empty(shape), persistent=False)
+        self.register_buffer("k", torch.empty(shape, device=device, dtype=dtype), persistent=False)
+        self.register_buffer("v", torch.empty(shape, device=device, dtype=dtype), persistent=False)
 
     def reset(self) -> None:
         """Rewind the buffers in place."""
         self.k.zero_()
         self.v.zero_()
 
-    def layer_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (k_buf, v_buf) views for one layer."""
-        return self.k[layer_idx], self.v[layer_idx]
+    def layer_kv(self, layer_idx: int, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return active-batch (k_buf, v_buf) views for one layer."""
+        return self.k[layer_idx, :batch_size], self.v[layer_idx, :batch_size]
 
 
 class _DepformerLayer(nn.Module):
@@ -167,7 +169,7 @@ class _DepformerLayer(nn.Module):
     ) -> torch.Tensor:
         """Run inner step ``step`` for a ``[B, 1, dim]`` input.
 
-        ``k_buf`` and ``v_buf`` are ``[max_batch, H, dep_q, Dh]`` views. Only
+        ``k_buf`` and ``v_buf`` are ``[B, H, dep_q, Dh]`` views. Only
         ``[:B, :, : step + 1]`` is read; slot ``step `` is written in place.
         """
         # --- self-attention (per-step weights, causal sliding window, no RoPE) ---
@@ -215,14 +217,12 @@ class PersonaPlexDepformer(nn.Module):
         config: PersonaPlexDepformerConfig,
         temporal_hidden_size: int,
         text_card: int = 32000,
-        max_graph_batch_size: int = 32,  # matches future cudagraph_capture_sizes ceiling
     ) -> None:
         super().__init__()
         self.config = config
         self.dep_q = config.dep_q
         self.card = config.card
         self.temporal_hidden_size = temporal_hidden_size
-        self.max_graph_batch_size = max_graph_batch_size
         dim = config.hidden_size
 
         # Per-codebook projection of the temporal hidden state (``depformer_multi_linear``).
@@ -233,13 +233,6 @@ class PersonaPlexDepformer(nn.Module):
         self.layers = nn.ModuleList([_DepformerLayer(config) for _ in range(config.num_hidden_layers)])
         # Per-codebook output heads (Moshi ``linears``).
         self.linears = nn.ModuleList([nn.Linear(dim, self.card, bias=False) for _ in range(self.dep_q)])
-        self.kv_buffers = _DepformerKVBuffers(
-            num_layers=config.num_hidden_layers,
-            max_batch=self.max_graph_batch_size,
-            num_heads=config.num_attention_heads,
-            dep_q=self.dep_q,
-            head_dim=config.head_dim,
-        )
 
     @torch.inference_mode()
     def forward(
@@ -250,6 +243,8 @@ class PersonaPlexDepformer(nn.Module):
         audio_provided: torch.Tensor | None = None,
         return_logits: bool = False,
         num_steps: int | None = None,
+        *,
+        graph_kv_buffers: _DepformerKVBuffers | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict the first ``num_steps`` (default ``dep_q``) audio codes for one frame.
 
@@ -265,6 +260,8 @@ class PersonaPlexDepformer(nn.Module):
                 first ``num_steps`` codes are identical to a full ``dep_q`` run;
                 the trailing steps predict the user's codebooks, which the serving
                 path never consumes.
+            graph_kv_buffers: optional fixed KV storage supplied by the CUDA-graph
+                wrapper. Without it, eager execution allocates storage for this batch.
 
         Returns:
             ``[B, num_steps]`` long tensor of sampled (greedy) audio codes, plus the
@@ -275,11 +272,39 @@ class PersonaPlexDepformer(nn.Module):
         steps = self.dep_q if num_steps is None else int(num_steps)
         if not 1 <= steps <= self.dep_q:
             raise ValueError(f"num_steps must be in [1, {self.dep_q}]; got {num_steps}")
-        if text_token.shape[0] > self.max_graph_batch_size:
-            raise ValueError(
-                f"depformer batch {text_token.shape[0]} exceeds max_graph_batch_size {self.max_graph_batch_size}"
+        batch_size = int(text_token.shape[0])
+        if graph_kv_buffers is None:
+            # Each KV prefix is written in order before attention reads it, so
+            # these call-local scratch buffers do not need zero-initialization.
+            kv_buffers = _DepformerKVBuffers(
+                num_layers=len(self.layers),
+                max_batch=batch_size,
+                num_heads=self.config.num_attention_heads,
+                dep_q=self.dep_q,
+                head_dim=self.config.head_dim,
+                device=transformer_out.device,
+                dtype=transformer_out.dtype,
             )
-        self.kv_buffers.reset()
+        else:
+            expected_shape = (
+                len(self.layers),
+                graph_kv_buffers.k.shape[1],
+                self.config.num_attention_heads,
+                self.dep_q,
+                self.config.head_dim,
+            )
+            if graph_kv_buffers.k.shape != expected_shape or graph_kv_buffers.v.shape != expected_shape:
+                raise ValueError(
+                    "graph KV buffers have an incompatible shape: "
+                    f"k={tuple(graph_kv_buffers.k.shape)}, v={tuple(graph_kv_buffers.v.shape)}, "
+                    f"expected [layers, batch, heads, dep_q, head_dim] with shape {expected_shape}"
+                )
+            if batch_size > graph_kv_buffers.k.shape[1]:
+                raise ValueError(
+                    f"depformer batch {batch_size} exceeds graph KV buffer capacity {graph_kv_buffers.k.shape[1]}"
+                )
+            graph_kv_buffers.reset()
+            kv_buffers = graph_kv_buffers
         prev = text_token
         codes: list[torch.Tensor] = []
         logits_all: list[torch.Tensor] = []
@@ -291,7 +316,7 @@ class PersonaPlexDepformer(nn.Module):
                 cond = self.depformer_emb[step - 1](prev.unsqueeze(1))
             x = x + cond
             for li, layer in enumerate(self.layers):
-                k_buf, v_buf = self.kv_buffers.layer_kv(li)
+                k_buf, v_buf = kv_buffers.layer_kv(li, batch_size)
                 x = layer(x, step, k_buf, v_buf)
             logits = self.linears[step](x).squeeze(1)  # [B, card]
             sampled = logits.float().argmax(dim=-1)  # greedy [B]

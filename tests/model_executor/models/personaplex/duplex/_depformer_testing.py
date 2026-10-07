@@ -44,14 +44,12 @@ def init_depformer_weights(module: nn.Module, seed: int = 0) -> None:
 def make_depformer(
     device: torch.device | None = None,
     *,
-    max_graph_batch_size: int = 8,
     seed: int = 0,
 ) -> PersonaPlexDepformer:
     model = PersonaPlexDepformer(
         tiny_depformer_config(),
         temporal_hidden_size=TEMPORAL,
         text_card=TEXT_CARD,
-        max_graph_batch_size=max_graph_batch_size,
     )
     if device is not None:
         model.to(device)
@@ -65,7 +63,6 @@ def clone_depformer(
 ) -> PersonaPlexDepformer:
     dst = make_depformer(
         device,
-        max_graph_batch_size=src.max_graph_batch_size,
         seed=1,
     )
     dst.load_state_dict(src.state_dict())
