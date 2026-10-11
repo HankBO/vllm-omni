@@ -1496,18 +1496,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             selected_req_ids.append(req_id)
             selected_req_infos.append(cast(dict[str, Any], req_info))
 
-        if not selected_indices:
+        if not selected_indices and not duplex_indices:
             return multimodal_outputs
-        if sampled_token_ids.ndim != 2 or sampled_token_ids.shape[0] < len(req_ids):
-            raise ValueError(
-                "post_sample_talker_mtp sampled-token rows do not match requests: "
-                f"shape={tuple(sampled_token_ids.shape)}, requests={len(req_ids)}"
-            )
-        if sampled_token_ids.shape[1] != 1:
-            raise ValueError(
-                "post_sample_talker_mtp does not support speculative token rows: "
-                f"shape={tuple(sampled_token_ids.shape)}"
-            )
+        if selected_indices:
+            if sampled_token_ids.ndim != 2 or sampled_token_ids.shape[0] < len(req_ids):
+                raise ValueError(
+                    "post_sample_talker_mtp sampled-token rows do not match requests: "
+                    f"shape={tuple(sampled_token_ids.shape)}, requests={len(req_ids)}"
+                )
+            if sampled_token_ids.shape[1] != 1:
+                raise ValueError(
+                    "post_sample_talker_mtp does not support speculative token rows: "
+                    f"shape={tuple(sampled_token_ids.shape)}"
+                )
 
         empty_audio = torch.empty(0, dtype=torch.long, device=sample_hidden_states.device)
         merged = dict(multimodal_outputs) if isinstance(multimodal_outputs, dict) else {}
@@ -1526,6 +1527,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             per_request_audio = [empty_audio for _ in req_ids]
         for idx in duplex_indices:
             per_request_audio[idx] = empty_audio
+
+        if not selected_indices:
+            # return a copied payload with audio cleared for stale duplex rows
+            codes_payload["audio"] = per_request_audio
+            merged["codes"] = codes_payload
+            return merged
 
         indices = torch.tensor(
             selected_indices,

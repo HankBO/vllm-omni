@@ -194,6 +194,25 @@ def test_post_sample_talker_mtp_skips_stale_epoch_after_metadata_merge() -> None
     assert audio[0].numel() == 0
     assert audio[1].tolist() == [[202] * 8]
 
+    stale_only_input = {
+        "codes": {"audio": torch.tensor([[70, 71, 72]], dtype=torch.long)},
+        "meta": {"source": "temporal"},
+    }
+    stale_only = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["old"],
+        valid_sampled_token_ids=[[101]],
+        sampled_token_ids=torch.tensor([[101]], dtype=torch.long),
+        invalid_req_indices=[],
+        sample_hidden_states=torch.tensor([[1.0, 2.0]]),
+        multimodal_outputs=stale_only_input,
+    )
+
+    assert depformer_batches == [1]
+    assert stale_only["codes"]["audio"][0].numel() == 0
+    assert stale_only["meta"] == {"source": "temporal"}
+    assert stale_only_input["codes"]["audio"].tolist() == [[70, 71, 72]]
+
 
 def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
     runner, received = _mtp_runner(
