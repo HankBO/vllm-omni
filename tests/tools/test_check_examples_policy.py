@@ -183,6 +183,22 @@ def test_policy_rejects_committed_and_staged_new_example_paths(tmp_path):
         "examples/测试路径.py",
     }
 
+    # A later commit may remove those paths or move them out of examples/.
+    (examples / "added.py").unlink()
+    (examples / "copied.py").unlink()
+    (tmp_path / "tools").mkdir()
+    git("mv", "examples/renamed.py", "tools/renamed.py")
+    (examples / "staged.py").unlink()
+    unicode_path.unlink()
+    git("add", "-A", "examples")
+
+    with patch("tools.pre_commit.check_examples_policy.REPO_ROOT", tmp_path):
+        remaining_example_paths = _get_added_paths(base)
+        removal_result = main(["--base-ref", base])
+
+    assert remaining_example_paths == []
+    assert removal_result == 0
+
     # A repository without a merge base must fail rather than skip the check.
     repo_without_merge_base = tmp_path / "repo_without_merge_base"
     repo_without_merge_base.mkdir()

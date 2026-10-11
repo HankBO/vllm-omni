@@ -96,35 +96,28 @@ def _get_merge_base(base_ref: str) -> str:
 
 
 def _get_added_paths(merge_base: str) -> list[str]:
-    # Inspect both the committed branch diff and the index. The former is
-    # needed in CI; the latter lets pre-commit reject a new path before commit.
-    diff_commands = [
-        ["git", "diff", merge_base, "HEAD"],
-        ["git", "diff", "--cached", merge_base],
-    ]
-    paths: set[str] = set()
-    for diff_command in diff_commands:
-        result = subprocess.run(
-            [
-                *diff_command,
-                "--name-only",
-                "-z",
-                "--find-copies",
-                "--diff-filter=ACR",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-        )
-        if result.returncode != 0:
-            print("check_examples_policy: git diff failed", file=sys.stderr)
-            sys.exit(1)
-        paths.update(
-            line.strip()
-            for line in result.stdout.split("\0")
-            if line.strip().startswith("examples/") and line.strip().endswith(".py")
-        )
-    return sorted(paths)
+    # Compare the proposed index tree with the merge base. In CI, checkout's
+    # index matches HEAD; locally, this checks exactly the tree being committed.
+    result = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--cached",
+            merge_base,
+            "--name-only",
+            "-z",
+            "--find-renames",
+            "--find-copies",
+            "--diff-filter=ACR",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    if result.returncode != 0:
+        print("check_examples_policy: git diff failed", file=sys.stderr)
+        sys.exit(1)
+    return sorted(path for path in result.stdout.split("\0") if path.startswith("examples/") and path.endswith(".py"))
 
 
 def main(argv: list[str] | None = None) -> int:
