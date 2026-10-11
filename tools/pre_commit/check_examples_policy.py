@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BASELINE_FILE = Path(__file__).parent / "examples_policy_baseline.txt"
+BASELINE_RELATIVE_PATH = Path("tools/pre_commit/examples_policy_baseline.txt")
 
 # Approved exceptions: paths that are genuinely model-neutral task/protocol
 # runners. Each entry must include a justification comment above it.
@@ -63,10 +63,30 @@ written justification and request maintainer review.
 """.strip()
 
 
-def _load_baseline() -> set[str]:
-    if not BASELINE_FILE.is_file():
+def _load_baseline(revision: str) -> set[str]:
+    baseline_spec = f"{revision}:{BASELINE_RELATIVE_PATH.as_posix()}"
+    exists = subprocess.run(
+        ["git", "cat-file", "-e", baseline_spec],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    if exists.returncode != 0:
         return set()
-    lines = BASELINE_FILE.read_text().splitlines()
+
+    result = subprocess.run(
+        ["git", "show", baseline_spec],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    if result.returncode != 0:
+        print(
+            f"check_examples_policy: could not load baseline from {revision}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    lines = result.stdout.splitlines()
     return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
 
 
@@ -131,8 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("filenames", nargs="*")
     args = parser.parse_args(argv)
 
-    baseline = _load_baseline()
     merge_base = _get_merge_base(args.base_ref)
+    baseline = _load_baseline(merge_base)
     added_paths = _get_added_paths(merge_base)
 
     errors: list[str] = []

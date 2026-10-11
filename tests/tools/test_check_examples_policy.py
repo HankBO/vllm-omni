@@ -29,12 +29,12 @@ def test_baseline_file_exists():
 
 
 def test_baseline_not_empty():
-    baseline = _load_baseline()
+    baseline = _load_baseline("HEAD")
     assert len(baseline) > 0, "baseline must not be empty"
 
 
 def test_baseline_only_python_paths():
-    baseline = _load_baseline()
+    baseline = _load_baseline("HEAD")
     for path in baseline:
         assert path.endswith(".py"), f"non-Python path in baseline: {path}"
         assert path.startswith("examples/"), f"path outside examples/: {path}"
@@ -61,11 +61,12 @@ def test_no_new_paths_passes():
 
 def test_grandfathered_path_passes():
     # A path already in baseline should pass
-    baseline = _load_baseline()
+    baseline = _load_baseline("HEAD")
     existing = next(iter(baseline))
     with patch("tools.pre_commit.check_examples_policy._get_added_paths", return_value=[existing]):
         with patch("tools.pre_commit.check_examples_policy._get_merge_base", return_value="abc123"):
-            result = main(["--base-ref", "origin/main"])
+            with patch("tools.pre_commit.check_examples_policy._load_baseline", return_value=baseline):
+                result = main(["--base-ref", "origin/main"])
     assert result == 0
 
 
@@ -74,7 +75,8 @@ def test_approved_exception_passes():
     exception = next(iter(APPROVED_EXCEPTIONS))
     with patch("tools.pre_commit.check_examples_policy._get_added_paths", return_value=[exception]):
         with patch("tools.pre_commit.check_examples_policy._get_merge_base", return_value="abc123"):
-            result = main(["--base-ref", "origin/main"])
+            with patch("tools.pre_commit.check_examples_policy._load_baseline", return_value=set()):
+                result = main(["--base-ref", "origin/main"])
     assert result == 0
 
 
@@ -83,7 +85,8 @@ def test_new_model_specific_path_fails():
     new_path = "examples/offline_inference/some_new_model/end2end.py"
     with patch("tools.pre_commit.check_examples_policy._get_added_paths", return_value=[new_path]):
         with patch("tools.pre_commit.check_examples_policy._get_merge_base", return_value="abc123"):
-            result = main(["--base-ref", "origin/main"])
+            with patch("tools.pre_commit.check_examples_policy._load_baseline", return_value=set()):
+                result = main(["--base-ref", "origin/main"])
     assert result == 1
 
 
@@ -144,11 +147,14 @@ def test_policy_rejects_committed_and_staged_new_example_paths(tmp_path):
     git("config", "user.name", "Test User")
     examples = tmp_path / "examples"
     examples.mkdir()
+    baseline_file = tmp_path / "tools/pre_commit/examples_policy_baseline.txt"
+    baseline_file.parent.mkdir(parents=True)
+    baseline_file.write_text("# baseline\nexamples/offline_inference/grandfathered.py\n")
     (examples / "copy_source.py").write_text("copy source\n")
     (examples / "rename_source.py").write_text("rename source\n")
     (examples / "modify.py").write_text("before\n")
     (examples / "delete.py").write_text("delete\n")
-    git("add", "examples")
+    git("add", "examples", "tools")
     git("commit", "-qm", "base")
     base = git("rev-parse", "HEAD")
 
@@ -186,7 +192,7 @@ def test_policy_rejects_committed_and_staged_new_example_paths(tmp_path):
     # A later commit may remove those paths or move them out of examples/.
     (examples / "added.py").unlink()
     (examples / "copied.py").unlink()
-    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools").mkdir(exist_ok=True)
     git("mv", "examples/renamed.py", "tools/renamed.py")
     (examples / "staged.py").unlink()
     unicode_path.unlink()
@@ -198,6 +204,17 @@ def test_policy_rejects_committed_and_staged_new_example_paths(tmp_path):
 
     assert remaining_example_paths == []
     assert removal_result == 0
+
+    # A staged baseline edit cannot grandfather a new path in the same change.
+    (examples / "baseline_override.py").write_text("new example\n")
+    with baseline_file.open("a") as baseline:
+        baseline.write("examples/baseline_override.py\n")
+    git("add", "examples/baseline_override.py", "tools/pre_commit/examples_policy_baseline.txt")
+
+    with patch("tools.pre_commit.check_examples_policy.REPO_ROOT", tmp_path):
+        override_result = main(["--base-ref", base])
+
+    assert override_result == 1
 
     # A repository without a merge base must fail rather than skip the check.
     repo_without_merge_base = tmp_path / "repo_without_merge_base"
